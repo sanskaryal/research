@@ -8,6 +8,8 @@ The project is split into two main files:
 
 1.  `data_downloader.py`: A utility script to download the necessary OrganMNIST datasets (Axial, Coronal, and Sagittal views).
 2.  `caps_initial.py`: The main script that defines, trains, and evaluates the CapsNet model on one of the downloaded datasets.
+3.  `federated_caps.py`: A script that trains the CapsNet model in a federated learning setting.
+
 
 ## Requirements
 
@@ -43,6 +45,14 @@ The script will:
 - Train the model for 30 epochs.
 - Print the validation accuracy after each epoch.
 - Report the final test accuracy after training is complete.
+
+### 3. Run the Federated Training Script
+
+To train the CapsNet model using federated learning, run the `federated_caps.py` script:
+
+```bash
+python federated_caps.py
+```
 
 ## Configuration
 

@@ -32,21 +32,21 @@ from data_downloader import _choose_dataclass
 # Configuration
 # =============================
 CONFIG = {
-    # Data
+    # Datas
     "view": "axial",
     "image_size": 28,
-    "data_root": r"C:\Users\DELL\medmnist_data",
+    "data_root": "data/",
 
     # Federated setup
-    "num_clients": 6,          # fewer clients
-    "frac_clients": 0.5,
+    "num_clients": 10,          # fewer clients
+    "frac_clients": 0.8,
     "rounds": 12,              # fewer rounds to test quickly
-    "local_epochs": 1,         # 1 local epoch per round at first
-    "batch_size": 32,          # smaller batches help CPU
+    "local_epochs": 1,         # 1 local epoch per rounsd at first
+    "batch_size": 64,          # smaller batches help CPU
     "num_workers": 0,
 
     # IID vs non-IID
-    "iid": True,               # set False + alpha below for non-IID
+    "iid": False,               # set False + alpha below for non-IID
     "dirichlet_alpha": 0.5,
 
     # Optimization
