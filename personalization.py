@@ -44,7 +44,7 @@ CONFIG = {
 
     # IID vs non-IID
     "iid": False,
-    "dirichlet_alpha": 0.1,
+    "dirichlet_alpha": 1,
 
     # Optimization
     "lr": 2e-4,

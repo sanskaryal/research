@@ -21,3 +21,4 @@ dist/
 # Data files
 data/
 trained_models/
+results/

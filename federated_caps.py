@@ -93,16 +93,30 @@ def squash(tensor, dim=-1, eps=1e-9):
     return scale * tensor / torch.sqrt(squared_norm + eps)
 
 class ConvLayer(nn.Module):
-    """Initial convolutional layers."""
-    def __init__(self, in_channels=1, out_channels=256):
+    """A more sophisticated 3-layer convolutional block for feature extraction."""
+    def __init__(self, in_channels=1, out_channels=512):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=128, kernel_size=5, stride=1, padding=2)
-        self.conv2 = nn.Conv2d(in_channels=128, out_channels=out_channels, kernel_size=9, stride=1, padding=0)
+        self.features = nn.Sequential(
+            # Layer 1
+            nn.Conv2d(in_channels=in_channels, out_channels=128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
+            
+            # Layer 2
+            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=5, stride=1, padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
+
+            # Layer 3
+            nn.Conv2d(in_channels=256, out_channels=out_channels, kernel_size=5, stride=1, padding=0),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        return x
+        return self.features(x)
 
 class PrimaryCaps(nn.Module):
     """Primary capsules layer."""
@@ -170,8 +184,8 @@ class CapsNet(nn.Module):
     def __init__(self, img_size=28, num_classes=11):
         super().__init__()
         self.num_classes = num_classes
-        self.conv = ConvLayer(in_channels=1, out_channels=256)
-        self.primary = PrimaryCaps(num_capsules=8, in_channels=256, out_channels=32, kernel_size=9, stride=2, num_routes=32*6*6)
+        self.conv = ConvLayer(in_channels=1, out_channels=512)
+        self.primary = PrimaryCaps(num_capsules=8, in_channels=512, out_channels=32, kernel_size=9, stride=2, num_routes=32*6*6)
         self.digits = DigitCaps(num_capsules=num_classes, num_routes=32*6*6, in_channels=8, out_channels=16, routing_iters=3)
         self.decoder = Decoder(input_size=img_size, num_capsules=num_classes, dim_capsule=16)
         self.mse = nn.MSELoss()
@@ -449,7 +463,11 @@ def fed_avg(state_dicts, num_samples_list):
     for sd, n in zip(state_dicts, num_samples_list):
         w = n / total
         for k in agg.keys():
-            agg[k] += sd[k] * w
+            # Average floating point tensors; copy integer buffers
+            if torch.is_floating_point(agg[k]):
+                agg[k] += sd[k] * w
+            else:
+                agg[k] = sd[k]
     return agg
 
 # =============================
