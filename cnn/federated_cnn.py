@@ -35,7 +35,7 @@ CONFIG = {
     # Data
     "view": "axial",
     "image_size": 28,
-    "data_root": "data/",
+    "data_root": "../data/",
     "data_frac": 0.3,          # Fraction of training data to use (1.0 = all)
 
     # Federated setup

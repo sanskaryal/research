@@ -36,10 +36,10 @@ CONFIG = {
     "view": "axial",
     "image_size": 28,
     "data_root": "data/",
-    "data_frac": 1,          # Fraction of training data to use (1.0 = all)
+    "data_frac": 0.4,          # Fraction of training data to use (1.0 = all)
 
     # Federated setup
-    "num_clients": 10,          # fewer clients
+    "num_clients": 4,          # fewer clients
     "frac_clients": 1,
     "rounds": 50,              # fewer rounds to test quickly
     "local_epochs": 5,         # 1 local epoch per rounsd at first
@@ -49,7 +49,7 @@ CONFIG = {
     # IID vs non-IID
     "iid": True,               # set False + alpha below for non-IID
     "balance_iid": True,       # If True and iid is True, balances classes across clients
-    "dirichlet_alpha": 1,
+    "dirichlet_alpha": 0.2,
 
     # Optimization
     "lr": 2e-4,
@@ -264,6 +264,41 @@ def _collect_labels(dataset: Dataset):
     return np.asarray(ys, dtype=int)
 
 
+def hybrid_balanced_iid_partition(dataset: Dataset, num_clients: int, seed: int = 0):
+    """
+    Balances the dataset by oversampling minority classes and undersampling majority classes
+    to meet at the median class size.
+    """
+    targets = _collect_labels(dataset)
+    num_classes = int(targets.max() + 1)
+    idx_by_class = [np.where(targets == c)[0] for c in range(num_classes)]
+    rng = np.random.default_rng(seed)
+
+    # 1. Find the median class size as the target
+    class_sizes = [len(indices) for indices in idx_by_class]
+    target_size = int(np.median(class_sizes))
+    print(f"Targeting median class size of {target_size} samples.")
+
+    # 2. Resample each class to the target size
+    balanced_indices = []
+    for indices in idx_by_class:
+        current_size = len(indices)
+        if current_size < target_size:
+            # Oversample (with replacement)
+            resampled = rng.choice(indices, target_size, replace=True)
+        else:
+            # Undersample (without replacement)
+            resampled = rng.choice(indices, target_size, replace=False)
+        balanced_indices.extend(resampled)
+    
+    rng.shuffle(balanced_indices) # Shuffle the complete balanced dataset
+
+    # 3. Distribute the balanced dataset evenly
+    shards = np.array_split(balanced_indices, num_clients)
+
+    return [list(map(int, s)) for s in shards]
+
+
 def strictly_balanced_iid_partition(dataset: Dataset, num_clients: int, seed: int = 0):
     """
     Partitions the dataset into strictly balanced IID subsets by undersampling majority classes.
@@ -344,8 +379,8 @@ def dirichlet_non_iid_partition(dataset: Dataset, num_clients: int, alpha: float
 num_clients = CONFIG["num_clients"]
 if CONFIG["iid"]:
     if CONFIG.get("balance_iid", False):
-        print("Using STRICTLY BALANCED IID partitioning (with undersampling).")
-        client_parts = strictly_balanced_iid_partition(train_full, num_clients, seed=CONFIG["seed"])
+        print("Using HYBRID BALANCED IID partitioning (resampling to median).")
+        client_parts = hybrid_balanced_iid_partition(train_full, num_clients, seed=CONFIG["seed"])
     else:
         print("Using standard IID partitioning.")
         client_parts = iid_partition(train_full, num_clients, seed=CONFIG["seed"])
