@@ -94,23 +94,23 @@ def squash(tensor, dim=-1, eps=1e-9):
 
 class ConvLayer(nn.Module):
     """A more sophisticated 3-layer convolutional block for feature extraction."""
-    def __init__(self, in_channels=1, out_channels=512):
+    def __init__(self, in_channels=1, out_channels=256):
         super().__init__()
         self.features = nn.Sequential(
             # Layer 1
-            nn.Conv2d(in_channels=in_channels, out_channels=128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(in_channels=in_channels, out_channels=64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.1),
             
             # Layer 2
-            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=5, stride=1, padding=0),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=0),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.1),
 
             # Layer 3
-            nn.Conv2d(in_channels=256, out_channels=out_channels, kernel_size=5, stride=1, padding=0),
+            nn.Conv2d(in_channels=128, out_channels=out_channels, kernel_size=5, stride=1, padding=0),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
@@ -136,7 +136,7 @@ class PrimaryCaps(nn.Module):
 
 class DigitCaps(nn.Module):
     """Digit capsules layer with dynamic routing."""
-    def __init__(self, num_capsules=11, num_routes=32*6*6, in_channels=8, out_channels=16, routing_iters=3):
+    def __init__(self, num_capsules=11, num_routes=32*6*6, in_channels=8, out_channels=24, routing_iters=3):
         super().__init__()
         self.in_channels = in_channels
         self.num_routes = num_routes
@@ -160,7 +160,7 @@ class DigitCaps(nn.Module):
 
 class Decoder(nn.Module):
     """Decoder for reconstruction."""
-    def __init__(self, input_size=28, num_capsules=11, dim_capsule=16):
+    def __init__(self, input_size=28, num_capsules=11, dim_capsule=24):
         super().__init__()
         self.input_size = input_size
         in_features = num_capsules * dim_capsule
@@ -184,10 +184,10 @@ class CapsNet(nn.Module):
     def __init__(self, img_size=28, num_classes=11):
         super().__init__()
         self.num_classes = num_classes
-        self.conv = ConvLayer(in_channels=1, out_channels=512)
-        self.primary = PrimaryCaps(num_capsules=8, in_channels=512, out_channels=32, kernel_size=9, stride=2, num_routes=32*6*6)
-        self.digits = DigitCaps(num_capsules=num_classes, num_routes=32*6*6, in_channels=8, out_channels=16, routing_iters=3)
-        self.decoder = Decoder(input_size=img_size, num_capsules=num_classes, dim_capsule=16)
+        self.conv = ConvLayer(in_channels=1, out_channels=256)
+        self.primary = PrimaryCaps(num_capsules=8, in_channels=256, out_channels=32, kernel_size=9, stride=2, num_routes=32*6*6)
+        self.digits = DigitCaps(num_capsules=num_classes, num_routes=32*6*6, in_channels=8, out_channels=24, routing_iters=3)
+        self.decoder = Decoder(input_size=img_size, num_capsules=num_classes, dim_capsule=24)
         self.mse = nn.MSELoss()
     def forward(self, x, labels=None):
         feats = self.conv(x)
