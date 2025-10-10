@@ -114,8 +114,22 @@ def run_federated_personalization():
             else:
                 client_model.load_state_dict(base_state)
 
+            # Pre-training evaluation
+            pre_train_metrics = evaluate_caps(client_model, valid_loader)
+            
             sd, n, loss, acc = train_local_caps(client_model, client_datasets[cid], epochs=local_epochs, lr=CONFIG["lr"])
             
+            # Post-training evaluation
+            client_model.load_state_dict(sd) # Load the new weights for evaluation
+            post_train_metrics = evaluate_caps(client_model, valid_loader)
+
+            print(
+                f"    Client {cid:02d} | "
+                f"Pre-Train Acc: {pre_train_metrics['accuracy']:.4f} -> "
+                f"Post-Train Acc: {post_train_metrics['accuracy']:.4f} | "
+                f"Local Train Acc: {acc:.4f}"
+            )
+
             client_last_weights[cid] = deepcopy(sd)
             
             updates.append(sd)
@@ -125,6 +139,32 @@ def run_federated_personalization():
 
         new_state = fed_avg(updates, weights)
         global_model.load_state_dict(new_state)
+
+        # Print weights for each round to observe changes
+        print("\n" + "="*50)
+        print(f"WEIGHT COMPARISON (ROUND {r})")
+        print("="*50)
+        
+        # 1. Initial Global Weights (from the start of the round)
+        initial_weights = base_state['digits.W'].flatten()[:100]
+        print(f"\nInitial Global Weights (first 100):\n{initial_weights.numpy()}")
+
+        # 2. Personalized Weights (from the first client in the selection)
+        first_client_id = selected[0]
+        if client_last_weights[first_client_id] is not None:
+            # Re-create the personalized state for the first client to print it
+            p_weight = CONFIG["personalization_weight"]
+            perso_state_to_print = deepcopy(base_state)
+            for key in perso_state_to_print.keys():
+                perso_state_to_print[key] = (p_weight * base_state[key]) + ((1 - p_weight) * client_last_weights[first_client_id][key])
+            
+            perso_weights = perso_state_to_print['digits.W'].flatten()[:100]
+            print(f"\nPersonalized Weights for Client {first_client_id} (first 100):\n{perso_weights.numpy()}")
+
+        # 3. Aggregated Global Weights (at the end of the round)
+        aggregated_weights = new_state['digits.W'].flatten()[:100]
+        print(f"\nAggregated Global Weights (first 100):\n{aggregated_weights.numpy()}")
+        print("="*50 + "\n")
 
         val_metrics = evaluate_caps(global_model, valid_loader)
         test_metrics = evaluate_caps(global_model, test_loader)
