@@ -2,3 +2,5 @@ numpy
 torch
 torchvision
 medmnist
+pandas
+scikit-learn
