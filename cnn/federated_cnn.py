@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-federated_caps.py
-Federated Learning (FedAvg) with your original CapsNet on MedMNIST OrganMNIST.
-- Keeps CapsNet intact (routing, squash, margin+reconstruction loss).
+federated_cnn.py
+Federated Learning (FedAvg) with CNN on MedMNIST OrganMNIST.
+- Uses simple CNN architecture with cross-entropy loss.
 - Simulates multiple clients locally.
 - Supports IID and non-IID (Dirichlet) client splits.
 
 Run:
-  python federated_caps.py
+  python federated_cnn.py
 
 Adjust CONFIG at the top as needed.
 """
@@ -51,13 +51,8 @@ CONFIG = {
     "dirichlet_alpha": 0.1,
 
     # Optimization
-    "lr": 2e-4,
+    "lr": 0.01,               # SGD learning rate as specified
     "weight_decay": 0.0,
-
-    # CapsNet performance knobs (NEW)
-    "routing_iters": 2,        # keep routing but fewer iters
-    "primary_out_channels": 16,# halve maps -> halves routes
-    "primary_stride": 3,       # increases downsampling -> fewer routes
 
     # Misc
     "seed": 42,
@@ -83,110 +78,48 @@ device = torch.device(CONFIG["device"])
 print(f"Using device: {device}")
 
 # =============================
-# CapsNet (INTACT)
+# CNN Model
 # =============================
-def squash(tensor, dim=-1, eps=1e-9):
-    """Squashing activation function."""
-    squared_norm = (tensor ** 2).sum(dim=dim, keepdim=True)
-    scale = squared_norm / (1.0 + squared_norm)
-    return scale * tensor / torch.sqrt(squared_norm + eps)
-
-class ConvLayer(nn.Module):
-    """Initial convolutional layer."""
-    def __init__(self, in_channels=1, out_channels=256, kernel_size=9):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=1)
-    def forward(self, x):
-        return F.relu(self.conv(x))
-
-class PrimaryCaps(nn.Module):
-    """Primary capsules layer."""
-    def __init__(self, num_capsules=8, in_channels=256, out_channels=32, kernel_size=9, stride=2, num_routes=32*6*6):
-        super().__init__()
-        self.num_routes = num_routes
-        self.capsules = nn.ModuleList([
-            nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=0)
-            for _ in range(num_capsules)
-        ])
-    def forward(self, x):
-        u = [capsule(x) for capsule in self.capsules]
-        u = torch.stack(u, dim=1)          # B, Ck, Co, H, W
-        B, Ck, Co, H, W = u.shape
-        u = u.view(B, self.num_routes, Ck) # (B, routes, dim)
-        return squash(u, dim=-1)
-
-class DigitCaps(nn.Module):
-    """Digit capsules layer with dynamic routing."""
-    def __init__(self, num_capsules=11, num_routes=32*6*6, in_channels=8, out_channels=16, routing_iters=3):
-        super().__init__()
-        self.in_channels = in_channels
-        self.num_routes = num_routes
-        self.num_capsules = num_capsules
-        self.routing_iters = routing_iters
-        self.W = nn.Parameter(torch.randn(1, num_routes, num_capsules, out_channels, in_channels) * 0.01)
-    def forward(self, x):
-        B = x.size(0)
-        x = x[:, :, None, :, None]          # (B, routes, 1, in_dim, 1)
-        W = self.W.expand(B, -1, -1, -1, -1)
-        u_hat = torch.matmul(W, x)          # (B, routes, caps, out_dim, 1)
-        b_ij = torch.zeros(B, self.num_routes, self.num_capsules, 1, 1, device=x.device)
-        for i in range(self.routing_iters):
-            c_ij = F.softmax(b_ij, dim=2)
-            s_j = (c_ij * u_hat).sum(dim=1, keepdim=True)      # (B, 1, caps, out_dim, 1)
-            v_j = squash(s_j, dim=3)                           # squash over out_dim
-            if i < self.routing_iters - 1:
-                a_ij = (u_hat * v_j).sum(dim=3, keepdim=True)  # agreement
-                b_ij = b_ij + a_ij
-        return v_j.squeeze(1).squeeze(-1)   # (B, caps, out_dim)
-
-class Decoder(nn.Module):
-    """Decoder for reconstruction."""
-    def __init__(self, input_size=28, num_capsules=11, dim_capsule=16):
-        super().__init__()
-        self.input_size = input_size
-        in_features = num_capsules * dim_capsule
-        self.reconstruction = nn.Sequential(
-            nn.Linear(in_features, 512), nn.ReLU(inplace=True),
-            nn.Linear(512, 1024), nn.ReLU(inplace=True),
-            nn.Linear(1024, input_size * input_size), nn.Sigmoid(),
-        )
-    def forward(self, digit_caps_output, labels=None):
-        lengths = torch.norm(digit_caps_output, dim=2)  # (B, caps)
-        if labels is None:
-            _, max_idx = lengths.max(dim=1)
-            labels = torch.eye(lengths.size(1), device=digit_caps_output.device)[max_idx]
-        masked = (digit_caps_output * labels.unsqueeze(2)).reshape(digit_caps_output.size(0), -1)
-        recon = self.reconstruction(masked)
-        recon = recon.view(-1, 1, self.input_size, self.input_size)
-        return recon
-
-class CapsNet(nn.Module):
-    """Complete CapsNet model (unchanged)."""
-    def __init__(self, img_size=28, num_classes=11):
+class CNN(nn.Module):
+    """Simple CNN model for OrganMNIST classification."""
+    def __init__(self, num_classes=11):
         super().__init__()
         self.num_classes = num_classes
-        self.conv = ConvLayer(in_channels=1, out_channels=256, kernel_size=9)
-        self.primary = PrimaryCaps(num_capsules=8, in_channels=256, out_channels=32, kernel_size=9, stride=2, num_routes=32*6*6)
-        self.digits = DigitCaps(num_capsules=num_classes, num_routes=32*6*6, in_channels=8, out_channels=16, routing_iters=3)
-        self.decoder = Decoder(input_size=img_size, num_capsules=num_classes, dim_capsule=16)
-        self.mse = nn.MSELoss()
-    def forward(self, x, labels=None):
-        feats = self.conv(x)
-        pri = self.primary(feats)
-        digs = self.digits(pri)
-        recon = self.decoder(digs, labels)
-        return digs, recon
-    @staticmethod
-    def margin_loss(digit_caps_output, one_hot_labels, m_plus=0.9, m_minus=0.1, lambda_=0.5):
-        v = torch.norm(digit_caps_output, dim=2)
-        left = F.relu(m_plus - v) ** 2
-        right = F.relu(v - m_minus) ** 2
-        loss = one_hot_labels * left + lambda_ * (1.0 - one_hot_labels) * right
-        return loss.sum(dim=1).mean()
-    def total_loss(self, data, digit_caps_output, one_hot_labels, recon):
-        margin = self.margin_loss(digit_caps_output, one_hot_labels)
-        recon_loss = self.mse(recon.view(recon.size(0), -1), data.view(recon.size(0), -1))
-        return margin + 0.0005 * recon_loss
+        
+        # Conv1: 32 filters, kernel 5×5, stride 1, padding 2
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=32, kernel_size=5, stride=1, padding=2)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # 28→14
+        
+        # Conv2: 64 filters, kernel 5×5, stride 1, padding 2  
+        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=5, stride=1, padding=2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)  # 14→7
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(64 * 7 * 7, 500)  # 7x7 after two pooling operations
+        self.fc2 = nn.Linear(500, num_classes)
+        
+        # Loss function
+        self.criterion = nn.CrossEntropyLoss()
+    
+    def forward(self, x):
+        # Conv1 + ReLU + MaxPool
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        
+        # Conv2 + ReLU + MaxPool
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # FC1 + ReLU
+        x = F.relu(self.fc1(x))
+        
+        # FC2 (output logits)
+        x = self.fc2(x)
+        
+        return x
 
 # =============================
 # Data (MedMNIST OrganMNIST)
@@ -301,15 +234,15 @@ log_client_distributions(client_datasets, N_CLASSES)
 
 
 # =============================
-# FL helpers (CapsNet-aware)
+# FL helpers (CNN-aware)
 # =============================
 def make_loader(ds: Dataset, batch_size: int, shuffle: bool):
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=CONFIG["num_workers"])
 
-def train_local_caps(model, dataset: Dataset, epochs: int, lr: float):
+def train_local_cnn(model, dataset: Dataset, epochs: int, lr: float):
     model = deepcopy(model).to(device)
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
+    opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
 
     loader = make_loader(dataset, CONFIG["batch_size"], shuffle=True)
     
@@ -320,15 +253,14 @@ def train_local_caps(model, dataset: Dataset, epochs: int, lr: float):
             x = x.to(device)
             y = torch.as_tensor(y).squeeze().long().to(device)
 
-            one_hot = torch.eye(model.num_classes, device=device).index_select(dim=0, index=y)
             opt.zero_grad()
-            out, recon = model(x, labels=one_hot)
-            loss = model.total_loss(x, out, one_hot, recon)  # margin + 0.0005 * recon
+            logits = model(x)
+            loss = model.criterion(logits, y)
             loss.backward()
             opt.step()
             
             total_loss += loss.item() * x.size(0)
-            preds = torch.norm(out, dim=2).argmax(dim=1)
+            preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
 
@@ -337,7 +269,7 @@ def train_local_caps(model, dataset: Dataset, epochs: int, lr: float):
     return model.state_dict(), len(dataset), avg_loss, avg_acc
 
 @torch.no_grad()
-def evaluate_caps(model, loader):
+def evaluate_cnn(model, loader):
     model.eval()
     all_preds, all_labels = [], []
     total_loss = 0.0
@@ -351,12 +283,11 @@ def evaluate_caps(model, loader):
         else:
             all_labels.extend(labels.cpu().numpy())
         
-        out, recon = model(x)
-        one_hot_labels = torch.eye(model.num_classes, device=device).index_select(dim=0, index=labels)
-        loss = model.total_loss(x, out, one_hot_labels, recon)
+        logits = model(x)
+        loss = model.criterion(logits, labels)
         total_loss += loss.item() * x.size(0)
 
-        preds = torch.norm(out, dim=2).argmax(dim=1)
+        preds = logits.argmax(dim=1)
         all_preds.extend(preds.cpu().numpy())
 
     if not all_labels:
@@ -393,7 +324,7 @@ def fed_avg(state_dicts, num_samples_list):
 def get_filenames():
     """Create descriptive filenames for outputs."""
     iid_str = "iid" if CONFIG["iid"] else f"niid_{CONFIG['dirichlet_alpha']}"
-    base = f"fed_caps_{iid_str}_{CONFIG['num_clients']}clients"
+    base = f"fed_cnn_{iid_str}_{CONFIG['num_clients']}clients"
     
     if CONFIG["data_frac"] < 1.0:
         base += f"_frac{CONFIG['data_frac']}"
@@ -413,7 +344,7 @@ print(f"Model will be saved to: {MODEL_PATH}")
 # =============================
 # Federated Training (FedAvg)
 # =============================
-global_model = CapsNet(img_size=IMG_SIZE, num_classes=N_CLASSES).to(device)
+global_model = CNN(num_classes=N_CLASSES).to(device)
 print(f"Model Parameters: {sum(p.numel() for p in global_model.parameters() if p.requires_grad):,}")
 
 rounds = CONFIG["rounds"]
@@ -438,7 +369,7 @@ for r in range(1, rounds + 1):
     for cid in selected:
         client_model = deepcopy(global_model).to(device)
         client_model.load_state_dict(base_state)
-        sd, n, loss, acc = train_local_caps(client_model, client_datasets[cid], epochs=local_epochs, lr=CONFIG["lr"])
+        sd, n, loss, acc = train_local_cnn(client_model, client_datasets[cid], epochs=local_epochs, lr=CONFIG["lr"])
         updates.append(sd)
         weights.append(n)
         round_train_losses.append(loss)
@@ -449,8 +380,8 @@ for r in range(1, rounds + 1):
     global_model.load_state_dict(new_state)
 
     # evaluate on MedMNIST validation and test sets
-    val_metrics = evaluate_caps(global_model, valid_loader)
-    test_metrics = evaluate_caps(global_model, test_loader)
+    val_metrics = evaluate_cnn(global_model, valid_loader)
+    test_metrics = evaluate_cnn(global_model, test_loader)
 
     if val_metrics["accuracy"] > best_val:
         best_val = val_metrics["accuracy"]
@@ -489,7 +420,7 @@ print(f"Best Validation Accuracy: {best_val:.4f}")
 
 # Final test on the best model
 global_model.load_state_dict(torch.load(MODEL_PATH))
-final_test_metrics = evaluate_caps(global_model, test_loader)
+final_test_metrics = evaluate_cnn(global_model, test_loader)
 print(f"\nFinal Test Metrics on Best Model: {final_test_metrics}")
 
 # Append test metrics to results
