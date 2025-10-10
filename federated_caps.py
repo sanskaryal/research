@@ -36,28 +36,29 @@ CONFIG = {
     "view": "axial",
     "image_size": 28,
     "data_root": "data/",
-    "data_frac": 0.3,          # Fraction of training data to use (1.0 = all)
+    "data_frac": 1,          # Fraction of training data to use (1.0 = all)
 
     # Federated setup
     "num_clients": 10,          # fewer clients
     "frac_clients": 1,
     "rounds": 50,              # fewer rounds to test quickly
     "local_epochs": 5,         # 1 local epoch per rounsd at first
-    "batch_size": 64,          # smaller batches help CPU
+    "batch_size": 32,          # smaller batches help CPU
     "num_workers": 0,
 
     # IID vs non-IID
-    "iid": False,               # set False + alpha below for non-IID
-    "dirichlet_alpha": 0.1,
+    "iid": True,               # set False + alpha below for non-IID
+    "balance_iid": True,       # If True and iid is True, balances classes across clients
+    "dirichlet_alpha": 1,
 
     # Optimization
     "lr": 2e-4,
     "weight_decay": 0.0,
 
     # CapsNet performance knobs (NEW)
-    "routing_iters": 2,        # keep routing but fewer iters
-    "primary_out_channels": 16,# halve maps -> halves routes
-    "primary_stride": 3,       # increases downsampling -> fewer routes
+    "routing_iters": 3,        # keep routing but fewer iters
+    "primary_out_channels": 32,# halve maps -> halves routes
+    "primary_stride": 1,       # increases downsampling -> fewer routes
 
     # Misc
     "seed": 42,
@@ -92,12 +93,16 @@ def squash(tensor, dim=-1, eps=1e-9):
     return scale * tensor / torch.sqrt(squared_norm + eps)
 
 class ConvLayer(nn.Module):
-    """Initial convolutional layer."""
-    def __init__(self, in_channels=1, out_channels=256, kernel_size=9):
+    """Initial convolutional layers."""
+    def __init__(self, in_channels=1, out_channels=256):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=1)
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=128, kernel_size=5, stride=1, padding=2)
+        self.conv2 = nn.Conv2d(in_channels=128, out_channels=out_channels, kernel_size=9, stride=1, padding=0)
+
     def forward(self, x):
-        return F.relu(self.conv(x))
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        return x
 
 class PrimaryCaps(nn.Module):
     """Primary capsules layer."""
@@ -165,7 +170,7 @@ class CapsNet(nn.Module):
     def __init__(self, img_size=28, num_classes=11):
         super().__init__()
         self.num_classes = num_classes
-        self.conv = ConvLayer(in_channels=1, out_channels=256, kernel_size=9)
+        self.conv = ConvLayer(in_channels=1, out_channels=256)
         self.primary = PrimaryCaps(num_capsules=8, in_channels=256, out_channels=32, kernel_size=9, stride=2, num_routes=32*6*6)
         self.digits = DigitCaps(num_capsules=num_classes, num_routes=32*6*6, in_channels=8, out_channels=16, routing_iters=3)
         self.decoder = Decoder(input_size=img_size, num_capsules=num_classes, dim_capsule=16)
@@ -230,6 +235,7 @@ def iid_partition(dataset: Dataset, num_clients: int, seed: int = 0):
     shards = np.array_split(idx, num_clients)
     return [list(map(int, s)) for s in shards]
 
+
 def _collect_labels(dataset: Dataset):
     """Return a numpy array of class indices for dataset items."""
     ys = []
@@ -242,6 +248,59 @@ def _collect_labels(dataset: Dataset):
             y = int(y)
         ys.append(y)
     return np.asarray(ys, dtype=int)
+
+
+def strictly_balanced_iid_partition(dataset: Dataset, num_clients: int, seed: int = 0):
+    """
+    Partitions the dataset into strictly balanced IID subsets by undersampling majority classes.
+    1. Finds the size of the smallest class.
+    2. Undersamples all other classes to match this size.
+    3. Distributes the resulting balanced dataset evenly among clients.
+    """
+    targets = _collect_labels(dataset)
+    num_classes = int(targets.max() + 1)
+    idx_by_class = [np.where(targets == c)[0] for c in range(num_classes)]
+    rng = np.random.default_rng(seed)
+
+    # 1. Find the size of the smallest class
+    min_class_size = min(len(indices) for indices in idx_by_class)
+    print(f"Smallest class has {min_class_size} samples. Undersampling all classes to this size.")
+
+    # 2. Undersample all classes to match the smallest class size
+    balanced_indices = []
+    for indices in idx_by_class:
+        balanced_indices.extend(rng.choice(indices, min_class_size, replace=False))
+    
+    rng.shuffle(balanced_indices) # Shuffle the complete balanced dataset
+
+    # 3. Distribute the balanced dataset evenly
+    shards = np.array_split(balanced_indices, num_clients)
+
+    return [list(map(int, s)) for s in shards]
+
+
+def balanced_iid_partition(dataset: Dataset, num_clients: int, seed: int = 0):
+    """
+    Partitions the dataset into balanced IID subsets for each client.
+    Ensures each client receives an equal (or nearly equal) number of samples per class.
+    """
+    targets = _collect_labels(dataset)
+    num_classes = int(targets.max() + 1)
+    idx_by_class = [np.where(targets == c)[0] for c in range(num_classes)]
+    rng = np.random.default_rng(seed)
+
+    client_indices = [[] for _ in range(num_clients)]
+
+    for c_indices in idx_by_class:
+        rng.shuffle(c_indices)
+        shards = np.array_split(c_indices, num_clients)
+        for i in range(num_clients):
+            client_indices[i].extend(shards[i].tolist())
+
+    for i in range(num_clients):
+        rng.shuffle(client_indices[i]) # Shuffle samples within each client
+
+    return [list(map(int, indices)) for indices in client_indices]
 
 def dirichlet_non_iid_partition(dataset: Dataset, num_clients: int, alpha: float, seed: int = 0):
     """
@@ -270,8 +329,14 @@ def dirichlet_non_iid_partition(dataset: Dataset, num_clients: int, alpha: float
 
 num_clients = CONFIG["num_clients"]
 if CONFIG["iid"]:
-    client_parts = iid_partition(train_full, num_clients, seed=CONFIG["seed"])
+    if CONFIG.get("balance_iid", False):
+        print("Using STRICTLY BALANCED IID partitioning (with undersampling).")
+        client_parts = strictly_balanced_iid_partition(train_full, num_clients, seed=CONFIG["seed"])
+    else:
+        print("Using standard IID partitioning.")
+        client_parts = iid_partition(train_full, num_clients, seed=CONFIG["seed"])
 else:
+    print("Using non-IID partitioning.")
     client_parts = dirichlet_non_iid_partition(
         train_full, num_clients, alpha=CONFIG["dirichlet_alpha"], seed=CONFIG["seed"]
     )
