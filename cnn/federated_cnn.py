@@ -47,8 +47,8 @@ CONFIG = {
     "num_workers": 0,
 
     # IID vs non-IID
-    "iid": False,               # set False + alpha below for non-IID
-    "dirichlet_alpha": 0.1,
+    "iid": True,               # set False + alpha below for non-IID
+    "dirichlet_alpha": 0.2,
 
     # Optimization
     "lr": 0.01,               # SGD learning rate as specified

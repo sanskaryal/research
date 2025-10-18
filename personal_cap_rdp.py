@@ -34,26 +34,32 @@ CONFIG = {
     "view": "axial",
     "image_size": 28,
     "data_root": "data/",
-    "data_frac": 0.33,
+    "data_frac": 0.4,
 
     # Federated setup
     "num_clients": 4,
     "frac_clients": 1.0,
-    "rounds": 50,
+    "rounds": 30,
     "local_epochs": 5,         # Epochs for clients to train the global model
-    "batch_size": 32,
+    "batch_size": 128,
     "num_workers": 0,
 
     # Non-IID
-    "dirichlet_alpha": 0.1,
+    "dirichlet_alpha": 0.2,
 
     # Ditto Personalization
     "personalization_epochs": 2, # Epochs for personalized model training
     "personalization_lr": 1e-4,   # Learning rate for personalized models
     "lambda_ditto": 0.9,          # Ditto regularization strength
 
+    # RDP Privacy
+    "dp_delta": 1e-6,             # Target delta for DP
+    "target_epsilon": 20.0,        # Target total epsilon for the whole training
+    "dp_max_grad_norm": 3.0,      # Gradient clipping norm (C)
+    "delta_prime": 1e-6,          # delta' for composed privacy loss
+
     # Optimization
-    "lr": 2e-4,
+    "lr": 0.001,
     "weight_decay": 0.0,
 
     # Misc
@@ -259,26 +265,59 @@ log_client_distributions(client_train_datasets, N_CLASSES)
 def make_loader(ds: Dataset, batch_size: int, shuffle: bool):
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=CONFIG["num_workers"])
 
-def train_local_caps(model, dataset: Dataset, epochs: int, lr: float):
+def train_local_caps(model, dataset: Dataset, epochs: int, lr: float, noise_multiplier: float):
     model = deepcopy(model).to(device)
     model.train()
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
     loader = make_loader(dataset, CONFIG["batch_size"], shuffle=True)
+    
     total_loss, total_correct, total_samples = 0.0, 0, 0
+    
     for _ in range(epochs):
         for x, y in loader:
             x, y = x.to(device), torch.as_tensor(y).squeeze().long().to(device)
             one_hot = torch.eye(model.num_classes, device=device).index_select(dim=0, index=y)
+
+            # --- DP-specific changes: Manual gradient computation, clipping, and noise ---
             opt.zero_grad()
+
+            # 1. Compute per-sample gradients
             out, recon = model(x, labels=one_hot)
             loss = model.total_loss(x, out, one_hot, recon)
             loss.backward()
+
+            # 2. Clip gradients and add noise
+            total_norm = 0.0
+            for param in model.parameters():
+                if param.grad is not None:
+                    total_norm += param.grad.data.norm(2).item() ** 2
+            total_norm = total_norm ** 0.5
+            
+            clip_coef = min(CONFIG["dp_max_grad_norm"] / (total_norm + 1e-6), 1.0)
+
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.data.mul_(clip_coef)
+                    
+                    # Add Gaussian noise
+                    noise = torch.normal(
+                        0, 
+                        CONFIG["dp_max_grad_norm"] * noise_multiplier, 
+                        param.grad.shape, 
+                        device=device
+                    )
+                    param.grad.data.add_(noise / x.size(0)) # Scale noise by batch size
+
             opt.step()
+            # --- End of DP-specific changes ---
+
             total_loss += loss.item() * x.size(0)
             total_correct += (torch.norm(out, dim=2).argmax(dim=1) == y).sum().item()
             total_samples += x.size(0)
+            
     avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
     avg_acc = total_correct / total_samples if total_samples > 0 else 0.0
+    
     return model.state_dict(), len(dataset), avg_loss, avg_acc
 
 def train_ditto_personalized(model, global_model, dataset: Dataset, epochs: int, lr: float, lambda_ditto: float):
@@ -340,10 +379,99 @@ def fed_avg(state_dicts, num_samples_list):
     return agg
 
 # =============================
+# Privacy Accounting
+# =============================
+def calculate_privacy_loss(
+    num_samples: int,
+    epochs: int,
+    lr: float,
+    noise_multiplier: float,
+    max_grad_norm: float,
+    delta: float
+):
+    """Calculates epsilon_i for a client's local training based on user-provided formulas."""
+    if noise_multiplier == 0:
+        return float('inf')
+    
+    sigma = noise_multiplier * max_grad_norm
+    
+    # Sensitivity (Delta_i) from user's formula, with correction (removed learning rate)
+    sensitivity = epochs * (2 * max_grad_norm / num_samples) if num_samples > 0 else 0
+    
+    # Epsilon_i from user's formula
+    epsilon_i = (sensitivity / sigma) * np.sqrt(2 * np.log(1.25 / delta)) if sigma > 0 else float('inf')
+    
+    return epsilon_i
+
+def calculate_composed_privacy_loss(
+    epsilon_i: float,
+    delta: float,
+    delta_prime: float,
+    num_clients_per_round: int,
+    num_rounds: int,
+):
+    """Calculates total composed privacy loss (epsilon_total, delta_total) using advanced composition."""
+    N = num_clients_per_round
+    R = num_rounds
+    
+    # Epsilon_total from user's formula
+    term1 = np.sqrt(2 * N * R * np.log(1 / delta_prime)) * epsilon_i
+    term2 = (N * R * epsilon_i * (np.exp(epsilon_i) - 1)) / 2
+    epsilon_total = term1 + term2
+    
+    # Delta_total from user's formula
+    delta_total = N * R * delta + delta_prime
+    
+    return epsilon_total, delta_total
+
+def find_optimal_noise_multiplier(
+    target_epsilon: float,
+    num_samples: int,
+    epochs: int,
+    lr: float,
+    max_grad_norm: float,
+    delta: float,
+    delta_prime: float,
+    num_clients_per_round: int,
+    num_rounds: int,
+    noise_search_space=(1e-5, 1000.0),
+    tolerance=1e-3
+):
+    """Performs a binary search to find the noise multiplier that achieves the target epsilon."""
+    low, high = noise_search_space
+    
+    while high - low > tolerance:
+        mid = (low + high) / 2
+        
+        epsilon_i = calculate_privacy_loss(
+            num_samples=num_samples,
+            epochs=epochs,
+            lr=lr,
+            noise_multiplier=mid,
+            max_grad_norm=max_grad_norm,
+            delta=delta
+        )
+        
+        composed_epsilon, _ = calculate_composed_privacy_loss(
+            epsilon_i=epsilon_i,
+            delta=delta,
+            delta_prime=delta_prime,
+            num_clients_per_round=num_clients_per_round,
+            num_rounds=num_rounds
+        )
+        
+        if composed_epsilon > target_epsilon:
+            low = mid
+        else:
+            high = mid
+            
+    return high
+
+# =============================
 # File Naming
 # =============================
 def get_filenames():
-    base = f"ditto_caps_niid_{CONFIG['dirichlet_alpha']}_{CONFIG['num_clients']}clients_lambda{CONFIG['lambda_ditto']}"
+    base = f"rdp_ditto_caps_niid_{CONFIG['dirichlet_alpha']}_{CONFIG['num_clients']}clients_lambda{CONFIG['lambda_ditto']}_eps{CONFIG['target_epsilon']}_C{CONFIG['dp_max_grad_norm']}"
     csv_name = Path("results") / f"{base}.csv"
     csv_name.parent.mkdir(parents=True, exist_ok=True)
     return csv_name
@@ -357,6 +485,24 @@ print(f"Results will be saved to: {CSV_PATH}")
 global_model = CapsNet(img_size=IMG_SIZE, num_classes=N_CLASSES).to(device)
 personalized_models = [deepcopy(global_model) for _ in range(CONFIG["num_clients"])]
 print(f"Model Parameters: {sum(p.numel() for p in global_model.parameters() if p.requires_grad):,}")
+
+# --- Calculate optimal noise multiplier for target epsilon ---
+min_client_samples = min(len(ds) for ds in client_train_datasets)
+print(f"Worst-case privacy amplification is for client with {min_client_samples} samples.")
+
+noise_multiplier = find_optimal_noise_multiplier(
+    target_epsilon=CONFIG["target_epsilon"],
+    num_samples=min_client_samples,
+    epochs=CONFIG["local_epochs"],
+    lr=CONFIG["lr"],
+    max_grad_norm=CONFIG["dp_max_grad_norm"],
+    delta=CONFIG["dp_delta"],
+    delta_prime=CONFIG["delta_prime"],
+    num_clients_per_round=int(CONFIG["frac_clients"] * CONFIG["num_clients"]),
+    num_rounds=CONFIG["rounds"]
+)
+print(f"Using noise multiplier: {noise_multiplier:.4f} to achieve Epsilon={CONFIG['target_epsilon']:.2f}")
+# --- End noise calculation ---
 
 client_test_loaders = [make_loader(ds, CONFIG["batch_size"]*2, False) for ds in client_test_datasets]
 results_log = []
@@ -373,7 +519,13 @@ for r in range(1, CONFIG["rounds"] + 1):
     updates, weights, round_losses, round_accs = [], [], [], []
     for cid in selected_clients:
         local_model = deepcopy(global_model)
-        sd, n, loss, acc = train_local_caps(local_model, client_train_datasets[cid], epochs=CONFIG["local_epochs"], lr=CONFIG["lr"])
+        sd, n, loss, acc = train_local_caps(
+            local_model, 
+            client_train_datasets[cid], 
+            epochs=CONFIG["local_epochs"], 
+            lr=CONFIG["lr"],
+            noise_multiplier=noise_multiplier
+        )
         updates.append(sd); weights.append(n); round_losses.append(loss); round_accs.append(acc)
 
     # 3. Aggregate to update global model
@@ -391,6 +543,26 @@ for r in range(1, CONFIG["rounds"] + 1):
     round_time = time.time() - start
     global_test_metrics = evaluate_caps(global_model, test_loader)
     
+    # --- Privacy Loss Calculation ---
+    # We report the loss for the client with the fewest samples, as this is the worst-case.
+    epsilon_i = calculate_privacy_loss(
+        num_samples=min_client_samples, 
+        epochs=CONFIG["local_epochs"],
+        lr=CONFIG["lr"],
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=CONFIG["dp_max_grad_norm"],
+        delta=CONFIG["dp_delta"]
+    )
+    
+    epsilon_total, delta_total = calculate_composed_privacy_loss(
+        epsilon_i=epsilon_i,
+        delta=CONFIG["dp_delta"],
+        delta_prime=CONFIG["delta_prime"], # Standard practice to set delta_prime to a small value
+        num_clients_per_round=len(selected_clients),
+        num_rounds=r
+    )
+    # --- End Privacy Loss Calculation ---
+
     # Calculate weighted average for training loss and accuracy based on dataset size
     weighted_train_loss = np.average(round_losses, weights=weights)
     weighted_train_acc = np.average(round_accs, weights=weights)
@@ -399,9 +571,12 @@ for r in range(1, CONFIG["rounds"] + 1):
         "round": r,
         "train_loss": weighted_train_loss, "train_accuracy": weighted_train_acc,
         "global_test_accuracy": global_test_metrics['accuracy'], "time_seconds": round_time,
+        "epsilon_i": epsilon_i,
+        "epsilon_total": epsilon_total,
+        "delta_total": delta_total
     }
 
-    print(f"Round {r:02d} | Train Loss: {weighted_train_loss:.4f}, Train Acc: {weighted_train_acc:.4f} | Global Test Acc: {global_test_metrics['accuracy']:.4f} | Time: {round_time:.2f}s")
+    print(f"Round {r:02d} | Train Loss: {weighted_train_loss:.4f}, Train Acc: {weighted_train_acc:.4f} | Global Test Acc: {global_test_metrics['accuracy']:.4f} | Epsilon: {epsilon_total:.4f} | Time: {round_time:.2f}s")
 
     for cid in range(CONFIG["num_clients"]):
         loader = client_test_loaders[cid]
@@ -418,6 +593,23 @@ for r in range(1, CONFIG["rounds"] + 1):
 
 print(f"\nTraining finished in {time.time() - t0:.2f}s")
 print(f"Final results saved to {CSV_PATH}")
+
+
+# =============================
+# Save Final Models
+# =============================
+MODEL_DIR = Path("trained_models")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+model_base_name = CSV_PATH.stem
+global_model_path = MODEL_DIR / f"{model_base_name}_global_model.pth"
+torch.save(global_model.state_dict(), global_model_path)
+print(f"Saved final global model to: {global_model_path}")
+
+for cid, p_model in enumerate(personalized_models):
+    p_model_path = MODEL_DIR / f"{model_base_name}_personalized_client_{cid}.pth"
+    torch.save(p_model.state_dict(), p_model_path)
+    print(f"Saved personalized model for client {cid} to: {p_model_path}")
 
 
 # =============================

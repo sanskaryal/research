@@ -21,4 +21,5 @@ dist/
 # Data files
 data/
 trained_models/
-results/
+cnn/trained_models/
+cnn/__pycache__/

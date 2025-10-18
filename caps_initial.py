@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import random
 import time
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,12 +17,13 @@ from data_downloader import _choose_dataclass
 # Hardcoded parameters instead of argparse
 CONFIG = {
     "view": "axial",          # 'axial', 'coronal', or 'sagittal'
-    "epochs": 30,
-    "batch_size": 128,
-    "lr": 2e-4,
+    "epochs": 50,
+    "batch_size": 64,
+    "lr": 0.001,
     "seed": 42,
     "image_size": 28,
     "num_workers": 0,         # Set to 0 for simplicity
+    "data_fraction": 0.1,
 }
 
 # -----------------------------
@@ -154,6 +156,8 @@ def train_one_epoch(model, loader, opt, device):
     """Runs a single training epoch."""
     model.train()
     total_loss = 0.0
+    correct = 0
+    total = 0
     for x, y in loader:
         x = x.to(device)
         y = y.squeeze().long().to(device)
@@ -167,7 +171,12 @@ def train_one_epoch(model, loader, opt, device):
         
         total_loss += loss.item()
         
-    return total_loss / len(loader)
+        # Calculate training accuracy
+        preds = torch.norm(out, dim=2).argmax(dim=1)
+        correct += (preds == y).sum().item()
+        total += y.size(0)
+        
+    return total_loss / len(loader), correct / total
 
 @torch.no_grad()
 def evaluate(model, loader, device):
@@ -208,6 +217,11 @@ transform = transforms.Compose([
 ])
 
 train_ds = DataClass(split='train', transform=transform, download=True, root=DATA_ROOT)
+# Reduce the dataset size based on the data_fraction
+if CONFIG["data_fraction"] < 1.0:
+    num_train_samples = int(len(train_ds) * CONFIG["data_fraction"])
+    train_ds, _ = torch.utils.data.random_split(train_ds, [num_train_samples, len(train_ds) - num_train_samples])
+
 valid_ds = DataClass(split='val',   transform=transform, download=True, root=DATA_ROOT)
 test_ds  = DataClass(split='test',  transform=transform, download=True, root=DATA_ROOT)
 
@@ -223,6 +237,12 @@ model = CapsNet(img_size=IMG_SIZE, num_classes=N_CLASSES).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"])
 print(f"Model Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
+# Setup CSV logging
+log_file = f"training_log_frac{CONFIG['data_fraction']}.csv"
+with open(log_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(["epoch", "loss", "train_acc", "val_acc"])
+
 # Training Loop
 t0 = time.time()
 best_val_acc = -1.0
@@ -230,9 +250,14 @@ best_val_acc = -1.0
 for epoch in range(CONFIG["epochs"]):
     e0 = time.time()
     
-    loss = train_one_epoch(model, train_loader, opt, device)
+    loss, train_acc = train_one_epoch(model, train_loader, opt, device)
     val_acc = evaluate(model, valid_loader, device)
     
+    # Log to CSV
+    with open(log_file, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([epoch, loss, train_acc, val_acc])
+
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         # Optional: Save model here if needed
@@ -241,6 +266,7 @@ for epoch in range(CONFIG["epochs"]):
     print(
         f"Epoch {epoch:02d} | "
         f"Loss: {loss:.4f} | "
+        f"Train Acc: {train_acc:.4f} | "
         f"Val Acc: {val_acc:.4f} | "
         f"Time: {time.time() - e0:.2f}s"
     )

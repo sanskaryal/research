@@ -2,7 +2,7 @@
 """
 personal_cap.py
 Personalized Federated Learning (Ditto) with CapsNet on MedMNIST OrganMNIST.
-- Trains a global model via FedAvg.
+- Trains a global model via FedAvg (with optional DP-SGD).
 - Trains a personalized model for each client using Ditto regularization.
 - Simulates multiple clients with non-IID (Dirichlet) data splits.
 - Logs and compares the performance of the global vs. personalized model for each client.
@@ -11,6 +11,7 @@ Run:
   python personal_cap.py
 """
 
+import math
 import random
 import time
 from pathlib import Path
@@ -39,28 +40,37 @@ CONFIG = {
     # Federated setup
     "num_clients": 4,
     "frac_clients": 1.0,
-    "rounds": 50,
+    "rounds": 30,
     "local_epochs": 5,         # Epochs for clients to train the global model
     "batch_size": 32,
     "num_workers": 0,
 
     # Non-IID
-    "dirichlet_alpha": 0.1,
+    "dirichlet_alpha": 0.2,
 
-    # Ditto Personalization
-    "personalization_epochs": 2, # Epochs for personalized model training
-    "personalization_lr": 1e-4,   # Learning rate for personalized models
-    "lambda_ditto": 0.9,          # Ditto regularization strength
+    # Ditto Personalization (kept non-DP to preserve local accuracy)
+    "personalization_epochs": 2,
+    "personalization_lr": 1e-4,
+    "lambda_ditto": 0.9,
 
     # Optimization
-    "lr": 2e-4,
+    "lr": 0.001,
     "weight_decay": 0.0,
 
+    # DP settings
+    "dp_enabled": True,            # turn DP-SGD on/off for global model training
+    "dp_clip_C": 1.0,              # per-step global grad clip norm
+    "dp_noise_multiplier": None,   # if set (float), use this σ; else solve from target ε
+    "dp_delta": 1e-3,
+    "dp_delta_prime": 1e-4,
+    "dp_target_epsilon": 2.0,      # set total ε target (None to disable autotune)
+    # Note: ε accounting uses advanced composition approximation (per-round ε_i solved, then σ)
+    #       Sensitivity Δ_i = η * E * 2C / n_i with batch-level clipping + σ noise.
+    #       This is a practical, research-friendly bound (not tight moments accountant).
     # Misc
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
-
 
 N_CLASSES = 11  # OrganMNIST has 11 classes
 
@@ -254,44 +264,116 @@ def log_client_distributions(client_train_datasets, num_classes):
 log_client_distributions(client_train_datasets, N_CLASSES)
 
 # =============================
+# DP utilities (advanced composition inversion for σ)
+# =============================
+def _solve_eps_i_from_total_eps(eps_total, N, R, delta_prime, guess=0.5, max_iter=50):
+    """
+    Invert: eps_total ≈ sqrt(2 N R ln(1/delta')) * eps_i + (N R * eps_i * (exp(eps_i) - 1))/2
+    for eps_i using a damped Newton step. Returns a positive eps_i.
+    """
+    A = math.sqrt(2.0 * N * R * math.log(1.0 / delta_prime))
+    B = 0.5 * N * R
+
+    def f(e):  # lhs - target = 0
+        return A * e + B * e * (math.exp(e) - 1.0) - eps_total
+
+    def df(e):
+        return A + B * ((math.exp(e) - 1.0) + e * math.exp(e))
+
+    e = max(1e-6, guess)
+    for _ in range(max_iter):
+        val, g = f(e), df(e)
+        step = val / max(g, 1e-12)
+        e = max(1e-8, e - 0.5 * step)  # damped
+        if abs(step) < 1e-6:
+            break
+    return e
+
+def _sigma_for_target_total_epsilon(
+    eps_total, delta, delta_prime, N, R, eta, E, C, n_i
+):
+    """
+    Using Δ_i = eta * E * 2C / n_i and one-release bound:
+      eps_i = (Δ_i / σ) * sqrt(2 ln(1.25/δ))
+    combined with advanced composition to solve eps_i, then σ.
+    """
+    eps_i = _solve_eps_i_from_total_eps(eps_total, N, R, delta_prime)
+    sens = eta * E * (2.0 * C) / max(1, n_i)
+    denom = math.sqrt(2.0 * math.log(1.25 / delta))
+    sigma = (sens / max(eps_i, 1e-8)) * denom
+    return sigma, eps_i
+
+# =============================
 # FL helpers
 # =============================
 def make_loader(ds: Dataset, batch_size: int, shuffle: bool):
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=CONFIG["num_workers"])
 
-def train_local_caps(model, dataset: Dataset, epochs: int, lr: float):
+def train_local_caps(model, dataset: Dataset, epochs: int, lr: float, sigma_round: float = 0.0):
+    """
+    Global-model local training step. If sigma_round > 0 and CONFIG['dp_enabled'] is True,
+    apply DP-SGD style clipping + Gaussian noise per step.
+    """
     model = deepcopy(model).to(device)
     model.train()
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
     loader = make_loader(dataset, CONFIG["batch_size"], shuffle=True)
+
+    C = CONFIG.get("dp_clip_C", 1.0)
+    use_dp = CONFIG.get("dp_enabled", False) and (sigma_round is not None) and (sigma_round > 0.0)
+
     total_loss, total_correct, total_samples = 0.0, 0, 0
     for _ in range(epochs):
         for x, y in loader:
-            x, y = x.to(device), torch.as_tensor(y).squeeze().long().to(device)
+            x = x.to(device)
+            y = torch.as_tensor(y).squeeze().long().to(device)
+
             one_hot = torch.eye(model.num_classes, device=device).index_select(dim=0, index=y)
             opt.zero_grad()
             out, recon = model(x, labels=one_hot)
             loss = model.total_loss(x, out, one_hot, recon)
             loss.backward()
+
+            if use_dp:
+                # Global gradient norm -> clip to C, then add Gaussian noise N(0, (σ*C)^2)
+                with torch.no_grad():
+                    total_norm_sq = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            total_norm_sq += (p.grad.detach() ** 2).sum()
+                    total_norm = torch.sqrt(total_norm_sq + 1e-12)
+                    clip_coef = float(min(1.0, C / total_norm.item()))
+                    for p in model.parameters():
+                        if p.grad is None: continue
+                        p.grad.detach().mul_(clip_coef)
+                        p.grad.add_(torch.normal(
+                            mean=0.0,
+                            std=sigma_round * C,
+                            size=p.grad.shape,
+                            device=p.grad.device
+                        ))
+
             opt.step()
+
             total_loss += loss.item() * x.size(0)
-            total_correct += (torch.norm(out, dim=2).argmax(dim=1) == y).sum().item()
+            preds = torch.norm(out, dim=2).argmax(dim=1)
+            total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
+
     avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
     avg_acc = total_correct / total_samples if total_samples > 0 else 0.0
     return model.state_dict(), len(dataset), avg_loss, avg_acc
 
 def train_ditto_personalized(model, global_model, dataset: Dataset, epochs: int, lr: float, lambda_ditto: float):
+    """
+    Ditto personalization step (kept non-DP by design to preserve local accuracy).
+    """
     pers_model = deepcopy(model).to(device)
     pers_model.train()
-
-    # Global model is for regularization only, no need to copy, just set to eval mode.
     global_model.eval()
 
     opt = torch.optim.Adam(pers_model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
     loader = make_loader(dataset, CONFIG["batch_size"], shuffle=True)
-
-    # Get a detached dictionary of global parameters for the regularization term.
     global_params = {name: param.detach() for name, param in global_model.named_parameters()}
 
     for _ in range(epochs):
@@ -303,7 +385,6 @@ def train_ditto_personalized(model, global_model, dataset: Dataset, epochs: int,
             out, recon = pers_model(x, labels=one_hot)
             task_loss = pers_model.total_loss(x, out, one_hot, recon)
 
-            # Ditto regularization term, calculated robustly by parameter name.
             reg_loss = 0.0
             for name, param in pers_model.named_parameters():
                 if param.requires_grad:
@@ -343,7 +424,16 @@ def fed_avg(state_dicts, num_samples_list):
 # File Naming
 # =============================
 def get_filenames():
-    base = f"ditto_caps_niid_{CONFIG['dirichlet_alpha']}_{CONFIG['num_clients']}clients_lambda{CONFIG['lambda_ditto']}"
+    dp_tag = "dpOFF"
+    if CONFIG["dp_enabled"]:
+        if CONFIG["dp_noise_multiplier"] is not None:
+            dp_tag = f"dpSIG{CONFIG['dp_noise_multiplier']}"
+        elif CONFIG["dp_target_epsilon"] is not None:
+            dp_tag = f"dpEPS{CONFIG['dp_target_epsilon']}"
+        else:
+            dp_tag = "dpON"
+    base = f"ditto_caps_niid_{CONFIG['dirichlet_alpha']}_{CONFIG['num_clients']}c_" \
+           f"lambda{CONFIG['lambda_ditto']}_{dp_tag}"
     csv_name = Path("results") / f"{base}.csv"
     csv_name.parent.mkdir(parents=True, exist_ok=True)
     return csv_name
@@ -352,7 +442,7 @@ CSV_PATH = get_filenames()
 print(f"Results will be saved to: {CSV_PATH}")
 
 # =============================
-# Federated Training with Ditto Personalization
+# Federated Training with Ditto Personalization (+ DP for global)
 # =============================
 global_model = CapsNet(img_size=IMG_SIZE, num_classes=N_CLASSES).to(device)
 personalized_models = [deepcopy(global_model) for _ in range(CONFIG["num_clients"])]
@@ -364,22 +454,49 @@ t0 = time.time()
 
 for r in range(1, CONFIG["rounds"] + 1):
     start = time.time()
-    
-    # 1. Select clients
+
+    # 1) Client selection (all, since frac_clients=1.0 by default)
     m = max(1, int(CONFIG["frac_clients"] * CONFIG["num_clients"]))
     selected_clients = np.random.default_rng(CONFIG["seed"] + r).choice(CONFIG["num_clients"], size=m, replace=False)
 
-    # 2. Local training for global model update
+    # --- Decide per-round σ (noise multiplier) ---
+    if CONFIG["dp_enabled"]:
+        avg_n = int(np.mean([len(ds) for ds in client_train_datasets])) if client_train_datasets else 1
+        if CONFIG["dp_noise_multiplier"] is not None:
+            sigma_round = float(CONFIG["dp_noise_multiplier"])
+            eps_i_used = None
+        elif CONFIG.get("dp_target_epsilon") is not None:
+            sigma_round, eps_i_used = _sigma_for_target_total_epsilon(
+                eps_total=CONFIG["dp_target_epsilon"],
+                delta=CONFIG["dp_delta"],
+                delta_prime=CONFIG["dp_delta_prime"],
+                N=CONFIG["num_clients"],
+                R=CONFIG["rounds"],
+                eta=CONFIG["lr"],
+                E=CONFIG["local_epochs"],
+                C=CONFIG["dp_clip_C"],
+                n_i=max(1, avg_n)
+            )
+        else:
+            sigma_round, eps_i_used = 0.8, None
+    else:
+        sigma_round, eps_i_used = 0.0, None
+
+    # 2) Local training for global model update (DP-SGD if enabled)
     updates, weights, round_losses, round_accs = [], [], [], []
     for cid in selected_clients:
         local_model = deepcopy(global_model)
-        sd, n, loss, acc = train_local_caps(local_model, client_train_datasets[cid], epochs=CONFIG["local_epochs"], lr=CONFIG["lr"])
+        sd, n, loss, acc = train_local_caps(
+            local_model, client_train_datasets[cid],
+            epochs=CONFIG["local_epochs"], lr=CONFIG["lr"],
+            sigma_round=sigma_round
+        )
         updates.append(sd); weights.append(n); round_losses.append(loss); round_accs.append(acc)
 
-    # 3. Aggregate to update global model
+    # 3) Aggregate to update global model
     global_model.load_state_dict(fed_avg(updates, weights))
 
-    # 4. Ditto personalization for all clients
+    # 4) Ditto personalization for all clients (non-DP by design)
     for cid in range(CONFIG["num_clients"]):
         pers_sd = train_ditto_personalized(
             personalized_models[cid], global_model, client_train_datasets[cid],
@@ -387,21 +504,25 @@ for r in range(1, CONFIG["rounds"] + 1):
         )
         personalized_models[cid].load_state_dict(pers_sd)
 
-    # 5. Evaluation and Logging
+    # 5) Evaluation and Logging
     round_time = time.time() - start
     global_test_metrics = evaluate_caps(global_model, test_loader)
-    
-    # Calculate weighted average for training loss and accuracy based on dataset size
-    weighted_train_loss = np.average(round_losses, weights=weights)
-    weighted_train_acc = np.average(round_accs, weights=weights)
-    
+
+    # Weighted average for training loss/acc based on dataset size
+    weighted_train_loss = np.average(round_losses, weights=weights) if len(weights) else float('nan')
+    weighted_train_acc = np.average(round_accs, weights=weights) if len(weights) else float('nan')
+
+    # Simple DP logging (what σ used this round; optional eps_i_used)
     log_entry = {
         "round": r,
         "train_loss": weighted_train_loss, "train_accuracy": weighted_train_acc,
         "global_test_accuracy": global_test_metrics['accuracy'], "time_seconds": round_time,
+        "dp_sigma_round": sigma_round, "dp_eps_i_used": (eps_i_used if eps_i_used is not None else "")
     }
 
-    print(f"Round {r:02d} | Train Loss: {weighted_train_loss:.4f}, Train Acc: {weighted_train_acc:.4f} | Global Test Acc: {global_test_metrics['accuracy']:.4f} | Time: {round_time:.2f}s")
+    print(f"Round {r:02d} | Train Loss: {weighted_train_loss:.4f}, "
+          f"Train Acc: {weighted_train_acc:.4f} | Global Test Acc: {global_test_metrics['accuracy']:.4f} "
+          f"| σ: {sigma_round:.4f} | Time: {round_time:.2f}s")
 
     for cid in range(CONFIG["num_clients"]):
         loader = client_test_loaders[cid]
@@ -419,7 +540,6 @@ for r in range(1, CONFIG["rounds"] + 1):
 print(f"\nTraining finished in {time.time() - t0:.2f}s")
 print(f"Final results saved to {CSV_PATH}")
 
-
 # =============================
 # Final Cross-Client Evaluation
 # =============================
@@ -431,7 +551,7 @@ print("Evaluating each personalized model on its own data, global data, and anot
 final_results = []
 for cid in range(CONFIG["num_clients"]):
     pers_model = personalized_models[cid]
-    
+
     # 1. Performance on its own local test data
     own_test_loader = client_test_loaders[cid]
     own_acc = evaluate_caps(pers_model, own_test_loader)['accuracy'] if len(own_test_loader.dataset) > 0 else 0
@@ -443,14 +563,14 @@ for cid in range(CONFIG["num_clients"]):
     cross_cid = (cid + 1) % CONFIG["num_clients"]
     cross_test_loader = client_test_loaders[cross_cid]
     cross_acc = evaluate_caps(pers_model, cross_test_loader)['accuracy'] if len(cross_test_loader.dataset) > 0 else 0
-        
+
     final_results.append({
         "client_id": cid,
         "own_local_test_acc": own_acc,
         "global_test_acc": global_test_acc,
         f"cross_client_{cross_cid}_test_acc": cross_acc
     })
-    
+
     print(f"\n--- Client {cid:02d} Personalized Model ---")
     print(f"  - Accuracy on own local test data: {own_acc:.4f}")
     print(f"  - Accuracy on global test data:    {global_test_acc:.4f}")
@@ -461,4 +581,3 @@ df_final = pd.DataFrame(final_results)
 final_csv_path = Path("results") / f"final_evaluation_{Path(CSV_PATH).name}"
 df_final.to_csv(final_csv_path, index=False)
 print(f"\nFinal cross-client evaluation results saved to {final_csv_path}")
-

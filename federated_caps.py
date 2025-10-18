@@ -36,7 +36,7 @@ CONFIG = {
     "view": "axial",
     "image_size": 28,
     "data_root": "data/",
-    "data_frac": 0.4,          # Fraction of training data to use (1.0 = all)
+    "data_frac": 0.25,          # Fraction of training data to use (1.0 = all)
 
     # Federated setup
     "num_clients": 4,          # fewer clients
@@ -47,9 +47,9 @@ CONFIG = {
     "num_workers": 0,
 
     # IID vs non-IID
-    "iid": True,               # set False + alpha below for non-IID
+    "iid": False,               # set False + alpha below for non-IID
     "balance_iid": True,       # If True and iid is True, balances classes across clients
-    "dirichlet_alpha": 0.2,
+    "dirichlet_alpha": 0.08,
 
     # Optimization
     "lr": 2e-4,
@@ -61,7 +61,7 @@ CONFIG = {
     "primary_stride": 1,       # increases downsampling -> fewer routes
 
     # Misc
-    "seed": 42,
+    "seed": 41,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
 
